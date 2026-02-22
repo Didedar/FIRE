@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fire_postgres
+    environment:
+      POSTGRES_DB: fire_db
+      POSTGRES_USER: fire_user
+      POSTGRES_PASSWORD: fire_password
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

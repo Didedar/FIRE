@@ -1,0 +1,3 @@
+# This directory stores uploaded CSV files.
+# Do not commit CSV data files to version control.
+*.csv
