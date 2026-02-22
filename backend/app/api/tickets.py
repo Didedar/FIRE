@@ -192,9 +192,9 @@ def delete_ticket(ticket_id: UUID, db: Session = Depends(get_db)):
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
-    # Delete related AIAnalysis and Distribution first to avoid foreign key constraints
-    db.query(AIAnalysis).filter(AIAnalysis.ticket_id == ticket_id).delete(synchronize_session=False)
+    # Delete related Distribution first, then AIAnalysis to avoid foreign key constraints
     db.query(Distribution).filter(Distribution.ticket_id == ticket_id).delete(synchronize_session=False)
+    db.query(AIAnalysis).filter(AIAnalysis.ticket_id == ticket_id).delete(synchronize_session=False)
 
     db.delete(ticket)
     db.commit()
@@ -204,9 +204,9 @@ def delete_ticket(ticket_id: UUID, db: Session = Depends(get_db)):
 @router.delete("/api/tickets")
 @router.delete("/api/v1/tickets")
 def delete_all_tickets(db: Session = Depends(get_db)):
-    # Delete related records first
-    db.query(AIAnalysis).delete(synchronize_session=False)
+    # Delete related records first (Distribution depends on AIAnalysis)
     db.query(Distribution).delete(synchronize_session=False)
+    db.query(AIAnalysis).delete(synchronize_session=False)
 
     # Delete all tickets
     count = db.query(Ticket).delete(synchronize_session=False)
