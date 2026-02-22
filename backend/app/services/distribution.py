@@ -17,7 +17,7 @@ from app.models.manager import Manager
 from app.models.business_unit import BusinessUnit
 from app.models.ai_analysis import AIAnalysis
 from app.models.distribution import Distribution
-from app.services.nlp_client import analyze_ticket
+from app.services.nlp_client import analyze_ticket, load_rag_context
 from app.utils.geo import find_nearest_office, haversine
 
 
@@ -132,6 +132,9 @@ async def distribute_tickets(db: Session) -> dict:
     offices = db.query(BusinessUnit).all()
     all_managers = db.query(Manager).all()
 
+    # Load RAG context once for the whole batch
+    load_rag_context(db)
+
     # Get undistributed tickets
     distributed_ids = db.query(Distribution.ticket_id).subquery()
     tickets = (
@@ -166,6 +169,8 @@ async def distribute_tickets(db: Session) -> dict:
             nlp_result = await analyze_ticket(
                 text=ticket.description or "",
                 address=address_str,
+                db_session=db,
+                segment=ticket.segment,
             )
 
             # Save AI analysis

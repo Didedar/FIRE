@@ -206,6 +206,29 @@ KAZAKHSTAN_CITIES: dict[str, Tuple[float, float]] = {
     "zyryanovsk": (49.7333, 84.2667),
 }
 
+# Region name → nearest major city mapping (for addresses like "Карагандинская область")
+REGION_TO_CITY: dict[str, str] = {
+    "карагандинск": "караганда",
+    "алматинск": "алматы",
+    "астанинск": "астана",
+    "акмолинск": "кокшетау",
+    "актюбинск": "актобе",
+    "атырауск": "атырау",
+    "восточно-казахстанск": "усть-каменогорск",
+    "жамбылск": "тараз",
+    "западно-казахстанск": "уральск",
+    "костанайск": "костанай",
+    "кызылординск": "кызылорда",
+    "мангистауск": "актау",
+    "павлодарск": "павлодар",
+    "северо-казахстанск": "петропавловск",
+    "туркестанск": "шымкент",
+    "южно-казахстанск": "шымкент",
+    "абайск": "семей",
+    "жетысуск": "талдыкорган",
+    "улытауск": "жезказган",
+}
+
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Calculate distance in km between two coordinates using Haversine formula."""
@@ -247,22 +270,32 @@ class GeocodingService:
     async def geocode(self, address: str) -> Optional[GeoLocation]:
         """
         Geocode an address using cascade:
-        1. Try Nominatim OSM API
-        2. Fall back to Kazakhstan city dictionary
+        1. Try Nominatim OSM API with full address
+        2. Try Nominatim with simplified address (just city/region + country)
+        3. Fall back to Kazakhstan city dictionary (cities + regions)
         """
         if not address or not address.strip():
             return None
 
         logger.info(f"🌍 Геокодинг: '{address}'")
 
-        # Try Nominatim first
-        logger.info("   🔍 [1] Пробую Nominatim OSM API...")
+        # Try Nominatim with full address
+        logger.info("   🔍 [1] Пробую Nominatim OSM API (полный адрес)...")
         nominatim_result = await self._geocode_nominatim(address)
         if nominatim_result:
             logger.info(f"   ✅ Nominatim: {nominatim_result.city} ({nominatim_result.latitude:.4f}, {nominatim_result.longitude:.4f})")
             return nominatim_result
 
-        # Fall back to dictionary
+        # Try Nominatim with simplified address (remove microdistricts, house numbers)
+        simplified = self._simplify_address(address)
+        if simplified and simplified != address:
+            logger.info(f"   🔍 [1b] Пробую Nominatim с упрощённым адресом: '{simplified}'...")
+            nominatim_result = await self._geocode_nominatim(simplified)
+            if nominatim_result:
+                logger.info(f"   ✅ Nominatim (упрощ.): {nominatim_result.city} ({nominatim_result.latitude:.4f}, {nominatim_result.longitude:.4f})")
+                return nominatim_result
+
+        # Fall back to dictionary (cities + region-to-city mapping)
         logger.info("   🔍 [2] Nominatim не дал результат, пробую словарь городов КЗ...")
         dict_result = self._geocode_dictionary(address)
         if dict_result:
@@ -270,6 +303,27 @@ class GeocodingService:
             return dict_result
 
         logger.info("   ⚠️  Город не найден ни в одном источнике")
+        return None
+
+    def _simplify_address(self, address: str) -> Optional[str]:
+        """
+        Simplify address by removing microdistrict/house details.
+        'Казахстан, Карагандинская, мкр. Центральный, 9.0' → 'Карагандинская, Казахстан'
+        """
+        import re
+        parts = [p.strip() for p in address.split(",")]
+        # Remove parts that are microdistricts, house numbers, street details
+        simplified_parts = []
+        skip_patterns = re.compile(
+            r'^\d+\.?\d*$|^мкр\.?|^микрорайон|^ул\.?|^улица|^пр\.?|^проспект|'
+            r'^д\.?$|^дом|^кв\.?|^квартира|^корп|^стр\.?|^блок',
+            re.IGNORECASE
+        )
+        for part in parts:
+            if not skip_patterns.match(part):
+                simplified_parts.append(part)
+        if simplified_parts and len(simplified_parts) < len(parts):
+            return ", ".join(simplified_parts)
         return None
 
     async def _geocode_nominatim(self, address: str) -> Optional[GeoLocation]:
@@ -335,7 +389,7 @@ class GeocodingService:
 
         address_lower = address.lower()
 
-        # Check each city name in the dictionary
+        # Step 1: Direct city name match
         for city_name, (lat, lon) in KAZAKHSTAN_CITIES.items():
             if city_name in address_lower:
                 logger.info(f"Dictionary geocoded '{address}' via city '{city_name}' -> ({lat}, {lon})")
@@ -345,6 +399,20 @@ class GeocodingService:
                     city=city_name.capitalize(),
                     source="dictionary"
                 )
+
+        # Step 2: Region name → city mapping (e.g. "Карагандинская" → "Караганда")
+        for region_prefix, city_name in REGION_TO_CITY.items():
+            if region_prefix in address_lower:
+                coords = KAZAKHSTAN_CITIES.get(city_name)
+                if coords:
+                    lat, lon = coords
+                    logger.info(f"Dictionary geocoded '{address}' via region '{region_prefix}' → city '{city_name}' -> ({lat}, {lon})")
+                    return GeoLocation(
+                        latitude=lat,
+                        longitude=lon,
+                        city=city_name.capitalize(),
+                        source="dictionary"
+                    )
 
         return None
 

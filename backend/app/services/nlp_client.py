@@ -1,6 +1,6 @@
 """
 NLP Client Service
-Integrates with the NLP module for ticket analysis and geocoding.
+Integrates with the NLP module for ticket analysis, geocoding, and RAG.
 """
 
 import sys
@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 from nlp_module.analyzer import TicketAnalyzer
 from nlp_module.geocoding import GeocodingService, GeoLocation
+from nlp_module.rag import RAGKnowledgeBase
 from nlp_module.schemas import AnalysisResult
 
 from app.config import settings
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 # Initialize services (lazy loaded)
 _analyzer: Optional[TicketAnalyzer] = None
 _geocoder: Optional[GeocodingService] = None
+_rag: Optional[RAGKnowledgeBase] = None
 
 
 def _get_analyzer() -> TicketAnalyzer:
@@ -47,13 +49,43 @@ def _get_geocoder() -> GeocodingService:
     return _geocoder
 
 
+def _get_rag() -> RAGKnowledgeBase:
+    """Get or create the RAG knowledge base."""
+    global _rag
+    if _rag is None:
+        _rag = RAGKnowledgeBase()
+    return _rag
+
+
+def load_rag_context(db_session) -> None:
+    """
+    Load RAG knowledge base from the database.
+    Should be called once before processing a batch of tickets.
+    """
+    rag = _get_rag()
+    if not rag.is_loaded:
+        try:
+            rag.load_from_db(db_session)
+            logger.info("📚 RAG: База знаний загружена из БД")
+        except Exception as e:
+            logger.warning(f"📚 RAG: Не удалось загрузить базу знаний: {e}")
+
+
+def reload_rag_context(db_session) -> None:
+    """Force reload RAG knowledge base from the database."""
+    global _rag
+    _rag = RAGKnowledgeBase()
+    _rag.load_from_db(db_session)
+    logger.info("📚 RAG: База знаний перезагружена из БД")
+
+
 class _DummyAnalyzer:
     """Fallback analyzer when GROQ_API_KEY is not available."""
 
-    async def analyze(self, text: str) -> AnalysisResult:
+    async def analyze(self, text: str, rag_context: Optional[str] = None) -> AnalysisResult:
         return self.analyze_sync(text)
 
-    def analyze_sync(self, text: str) -> AnalysisResult:
+    def analyze_sync(self, text: str, rag_context: Optional[str] = None) -> AnalysisResult:
         """Generate fallback analysis."""
         ticket_type = self._guess_type(text)
         sentiment = self._guess_sentiment(text)
@@ -134,24 +166,46 @@ class _DummyAnalyzer:
         return priority_map.get(ticket_type, 5)
 
 
-async def analyze_ticket(text: str, address: str, country: str = None) -> NLPResponse:
+async def analyze_ticket(
+    text: str,
+    address: str,
+    country: str = None,
+    db_session=None,
+    segment: Optional[str] = None,
+) -> NLPResponse:
     """
     Analyze ticket text and geocode address.
+    If db_session is provided, uses RAG to enrich the LLM with company context.
     Returns combined NLP + geo response with nearest office.
     """
     analyzer = _get_analyzer()
     geocoder = _get_geocoder()
+    rag = _get_rag()
 
     logger.info("=" * 60)
     logger.info("🔥 NLP Pipeline START")
     logger.info(f"📝 Текст ({len(text)} символов): {text[:120]}...")
     logger.info(f"📍 Адрес: {address or '—'}")
 
-    # ── Step 1: NLP Analysis ──────────────────────
+    # ── Step 0: Load RAG if DB available ──────────
+    if db_session and not rag.is_loaded:
+        try:
+            load_rag_context(db_session)
+        except Exception as e:
+            logger.warning(f"   ⚠️  RAG загрузка пропущена: {e}")
+
+    # ── Step 1: NLP Analysis (with RAG context) ───
     logger.info("─" * 40)
     logger.info("🧠 [1/3] Анализ текста в NLP модуле...")
+
+    # Build RAG context for LLM
+    rag_context = None
+    if rag.is_loaded:
+        rag_context = rag.build_context(segment=segment)
+        logger.info(f"   📚 RAG контекст подготовлен ({len(rag_context)} символов)")
+
     try:
-        analysis = await analyzer.analyze(text)
+        analysis = await analyzer.analyze(text, rag_context=rag_context)
         logger.info(f"   ✅ Тип: {analysis.ticket_type}")
         logger.info(f"   ✅ Тональность: {analysis.sentiment}")
         logger.info(f"   ✅ Приоритет: {analysis.priority}/10")

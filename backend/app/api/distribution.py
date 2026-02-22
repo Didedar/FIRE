@@ -21,7 +21,7 @@ from app.models.manager import Manager
 from app.models.business_unit import BusinessUnit
 from app.models.distribution import Distribution
 from app.services.distribution import distribute_tickets
-from app.services.nlp_client import analyze_ticket
+from app.services.nlp_client import analyze_ticket, load_rag_context
 from app.services.csv_parser import (
     parse_tickets_csv,
     parse_managers_csv,
@@ -133,11 +133,13 @@ async def process_single_ticket(
     address_str = ", ".join(p for p in address_parts if p)
 
     try:
-        # Perform NLP analysis and geocoding
+        # Perform NLP analysis and geocoding (with RAG context)
         nlp_result = await analyze_ticket(
             text=request.description,
             address=address_str,
             country=request.country,
+            db_session=db,
+            segment=request.segment,
         )
 
         # Save AI analysis
@@ -327,6 +329,9 @@ async def process_batch(
     # Get all new tickets
     tickets = db.query(Ticket).filter(Ticket.status == "new").all()
 
+    # Load RAG context once for the whole batch
+    load_rag_context(db)
+
     processed = 0
     failed = 0
     errors = []
@@ -349,6 +354,8 @@ async def process_batch(
                     text=ticket.description or "",
                     address=address_str,
                     country=ticket.country,
+                    db_session=db,
+                    segment=ticket.segment,
                 )
 
                 # Save analysis
@@ -476,6 +483,9 @@ async def process_all(db: Session = Depends(get_db)):
     processed = 0
     failed = 0
 
+    # Load RAG context once for the whole batch
+    load_rag_context(db)
+
     semaphore = asyncio.Semaphore(settings.BATCH_SEMAPHORE_LIMIT)
 
     async def process_one(ticket: Ticket) -> bool:
@@ -493,6 +503,8 @@ async def process_all(db: Session = Depends(get_db)):
                     text=ticket.description or "",
                     address=address_str,
                     country=ticket.country,
+                    db_session=db,
+                    segment=ticket.segment,
                 )
 
                 # Save analysis
@@ -664,13 +676,13 @@ def get_stats(db: Session = Depends(get_db)):
 async def ai_assistant(request: dict, db: Session = Depends(get_db)):
     """
     AI assistant that takes natural language queries about distributions.
+    Uses RAG context + Groq LLM for intelligent answers, with keyword fallback.
     Returns structured data for chart rendering.
     """
     query = request.get("query", "").lower()
 
-    # Simple keyword-based query routing
+    # ── Keyword-based structured queries (for charts) ──
     if "тип" in query and ("город" in query or "офис" in query):
-        # Type distribution by city
         rows = (
             db.query(Ticket.city, AIAnalysis.type, func.count(Ticket.id))
             .join(AIAnalysis, AIAnalysis.ticket_id == Ticket.id)
@@ -690,10 +702,11 @@ async def ai_assistant(request: dict, db: Session = Depends(get_db)):
             "data": data,
         }
 
-    elif "нагрузк" in query or "менеджер" in query:
+    elif "нагрузк" in query or ("менеджер" in query and ("список" in query or "все" in query or "покаж" in query)):
         managers = db.query(Manager).options(joinedload(Manager.business_unit)).all()
         data = [
-            {"name": m.full_name, "load": m.current_load, "office": m.business_unit.name if m.business_unit else "—"}
+            {"name": m.full_name, "load": m.current_load, "office": m.business_unit.name if m.business_unit else "—",
+             "position": m.position, "skills": m.skills or []}
             for m in managers
         ]
         return {
@@ -752,11 +765,79 @@ async def ai_assistant(request: dict, db: Session = Depends(get_db)):
         }
 
     else:
-        # Generic stats
-        total = db.query(Ticket).count()
-        distributed = db.query(Ticket).filter(Ticket.status == "distributed").count()
+        # ── RAG-powered LLM answer for free-form questions ──
+        answer = await _rag_answer(request.get("query", ""), db)
         return {
-            "answer": f"Всего обращений: {total}, распределено: {distributed}. Попробуйте запросить: 'типы обращений по городам', 'нагрузка менеджеров', 'тональность', 'приоритет', 'язык', 'сегмент'.",
+            "answer": answer,
             "chart_type": None,
             "data": None,
         }
+
+
+async def _rag_answer(query: str, db: Session) -> str:
+    """
+    Use RAG context + Groq LLM to answer free-form questions about the system.
+    Falls back to basic stats if LLM is unavailable.
+    """
+    from app.config import settings
+
+    # Build RAG context from DB
+    rag = load_rag_context(db)
+    from app.services.nlp_client import _get_rag
+    rag_kb = _get_rag()
+
+    # Gather live stats
+    total = db.query(Ticket).count()
+    distributed = db.query(Ticket).filter(Ticket.status == "distributed").count()
+    analyzed = db.query(Ticket).filter(Ticket.status == "analyzed").count()
+    pending = db.query(Ticket).filter(Ticket.status == "new").count()
+
+    stats_context = (
+        f"\n[ТЕКУЩАЯ СТАТИСТИКА]\n"
+        f"Всего обращений: {total}\n"
+        f"Распределено: {distributed}\n"
+        f"Проанализировано (без менеджера): {analyzed}\n"
+        f"Ожидают обработки: {pending}\n"
+    )
+
+    # Build full context
+    rag_context = ""
+    if rag_kb.is_loaded:
+        rag_context = rag_kb.build_context()
+    rag_context += stats_context
+
+    # Try LLM
+    if settings.GROQ_API_KEY:
+        try:
+            from groq import Groq
+            client = Groq(api_key=settings.GROQ_API_KEY)
+
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты — ИИ-ассистент системы FIRE (Freedom Intelligent Routing Engine) "
+                            "для банка Freedom Finance. Отвечай на вопросы по данным системы. "
+                            "Отвечай кратко и по делу на русском языке.\n\n"
+                            f"--- КОНТЕКСТ ---\n{rag_context}"
+                        ),
+                    },
+                    {"role": "user", "content": query},
+                ],
+                temperature=0.3,
+                max_tokens=500,
+            )
+            return response.choices[0].message.content
+
+        except Exception as e:
+            logger.warning(f"AI assistant LLM error: {e}")
+
+    # Fallback
+    return (
+        f"Всего обращений: {total}, распределено: {distributed}, "
+        f"ожидают: {pending}. "
+        f"Попробуйте запросить: 'типы обращений по городам', "
+        f"'нагрузка менеджеров', 'тональность', 'приоритет', 'язык', 'сегмент'."
+    )

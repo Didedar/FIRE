@@ -21,7 +21,7 @@ from .schemas import AnalysisResult
 logger = logging.getLogger(__name__)
 
 # System prompt for LLM (exact from spec)
-SYSTEM_PROMPT = """Ты — классификатор обращений клиентов банка Freedom Finance.
+SYSTEM_PROMPT_BASE = """Ты — классификатор обращений клиентов банка Freedom Finance.
 Проанализируй текст и верни ТОЛЬКО валидный JSON без markdown:
 {
 "ticket_type": "<Жалоба|Смена данных|Консультация|Претензия|Неработоспособность приложения|Мошеннические действия|Спам>",
@@ -32,6 +32,9 @@ SYSTEM_PROMPT = """Ты — классификатор обращений кли
 }
 Приоритет: Мошеннические действия=9-10, Претензии с финансовыми потерями=7-8, Жалобы=4-6, Консультации/Спам=1-3.
 Язык по умолчанию RU. Резюме всегда на русском."""
+
+# Legacy alias for backward compatibility
+SYSTEM_PROMPT = SYSTEM_PROMPT_BASE
 
 # Valid values for validation
 VALID_TICKET_TYPES = {
@@ -61,6 +64,12 @@ class TicketAnalyzer:
         self.client = Groq(api_key=self.api_key)
         logger.info("TicketAnalyzer initialized with Groq client")
 
+    def _build_prompt(self, rag_context: Optional[str] = None) -> str:
+        """Build system prompt, optionally enriched with RAG context."""
+        if rag_context:
+            return f"{SYSTEM_PROMPT_BASE}\n\n--- КОНТЕКСТ КОМПАНИИ (используй для рекомендаций) ---\n{rag_context}"
+        return SYSTEM_PROMPT_BASE
+
     @retry(
         retry=retry_if_exception_type(RateLimitError),
         stop=stop_after_attempt(3),
@@ -69,25 +78,29 @@ class TicketAnalyzer:
             f"Rate limited, retrying in {retry_state.next_action.sleep} seconds..."
         ),
     )
-    async def analyze(self, text: str) -> AnalysisResult:
+    async def analyze(self, text: str, rag_context: Optional[str] = None) -> AnalysisResult:
         """
         Analyze ticket text using Groq LLM.
+        Optionally accepts RAG context to enrich the prompt with company data.
         Returns structured analysis result.
         """
         if not text or not text.strip():
             return self._fallback_analysis("")
 
         start_time = time.time()
+        system_prompt = self._build_prompt(rag_context)
 
         try:
             logger.info("=" * 50)
             logger.info(f"🤖 Groq LLM: Отправляю запрос → модель {self.MODEL}")
             logger.info(f"📝 Текст для анализа ({len(text)} символов): {text[:100]}...")
+            if rag_context:
+                logger.info(f"📚 RAG контекст: {len(rag_context)} символов")
 
             response = self.client.chat.completions.create(
                 model=self.MODEL,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": text},
                 ],
                 response_format={"type": "json_object"},
@@ -121,18 +134,19 @@ class TicketAnalyzer:
             logger.error(f"❌ Unexpected error during analysis: {e}")
             return self._fallback_analysis(text)
 
-    def analyze_sync(self, text: str) -> AnalysisResult:
+    def analyze_sync(self, text: str, rag_context: Optional[str] = None) -> AnalysisResult:
         """Synchronous version of analyze for non-async contexts."""
         if not text or not text.strip():
             return self._fallback_analysis("")
 
         start_time = time.time()
+        system_prompt = self._build_prompt(rag_context)
 
         try:
             response = self.client.chat.completions.create(
                 model=self.MODEL,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": text},
                 ],
                 response_format={"type": "json_object"},
